@@ -8,6 +8,7 @@ from enum import Enum
 from threading import Lock
 from uuid import uuid4
 
+from src.audit import AuditEvent, AuditLevel, AuditLog
 from src.bank import NightOperationError
 from src.bank_account import (
     AccountClosedError,
@@ -17,6 +18,7 @@ from src.bank_account import (
     InvalidOperationError,
     PremiumAccount,
 )
+from src.risk import RiskAnalyzer, RiskAssessment, RiskBlockedError, RiskLevel
 
 
 class TransactionType(str, Enum):
@@ -59,6 +61,7 @@ class Transaction:
     started_at: datetime | None = field(default=None, init=False)
     finished_at: datetime | None = field(default=None, init=False)
     errors: list[TransactionError] = field(default_factory=list, init=False)
+    risk: RiskAssessment | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.amount = BankAccount._validate_amount(self.amount)
@@ -71,10 +74,49 @@ class Transaction:
 
 
 class TransactionQueue:
-    def __init__(self, *, clock: Callable[[], datetime] = datetime.now) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] = datetime.now,
+        audit_log: AuditLog | None = None,
+        participant_id: Callable[[BankAccount], str] | None = None,
+    ) -> None:
         self._clock = clock
+        self._audit_log = audit_log
+        self._participant_id = participant_id
         self._pending: dict[str, tuple[Transaction, int, datetime]] = {}
         self._lock = Lock()
+
+    def _identify(self, account: BankAccount) -> str:
+        if not isinstance(account, BankAccount):
+            return ""
+        return self._participant_id(account) if self._participant_id else account.account_number
+
+    def _audit(
+        self,
+        transaction: Transaction,
+        action: str,
+        now: datetime,
+        *,
+        level: AuditLevel = AuditLevel.INFO,
+        error: str | None = None,
+    ) -> None:
+        if self._audit_log is not None:
+            risk = transaction.risk
+            self._audit_log.record(AuditEvent(
+                timestamp=now,
+                level=level,
+                action=action,
+                transaction_id=transaction.transaction_id,
+                sender_id=self._identify(transaction.sender),
+                recipient_id=self._identify(transaction.recipient),
+                amount=str(transaction.amount),
+                currency=transaction.currency,
+                risk=risk.level.value if risk else None,
+                reasons=risk.reasons if risk else (),
+                error=error,
+                detail=transaction.failure_reason,
+            ))
 
     def add(
         self,
@@ -97,6 +139,7 @@ class TransactionQueue:
             self._pending[transaction.transaction_id] = (transaction, priority, due)
             transaction.scheduled_at = due
             transaction.status = TransactionStatus.QUEUED
+            self._audit(transaction, "queued", now)
 
     def cancel(self, transaction_id: str) -> bool:
         with self._lock:
@@ -108,6 +151,7 @@ class TransactionQueue:
             transaction.status = TransactionStatus.CANCELLED
             transaction.failure_reason = "Cancelled"
             transaction.finished_at = now
+            self._audit(transaction, "cancelled", now)
             return True
 
     def _take_ready(self, now: datetime) -> tuple[Transaction, int] | None:
@@ -142,6 +186,7 @@ class TransactionProcessor:
         external_fee_rate: Decimal | int | float | str = "0.01",
         max_attempts: int = 3,
         retry_delay: timedelta = timedelta(hours=1),
+        risk_analyzer: RiskAnalyzer | None = None,
     ) -> None:
         if type(max_attempts) is not int or max_attempts < 1:
             raise InvalidOperationError("At least one attempt is required")
@@ -155,6 +200,29 @@ class TransactionProcessor:
         self._external_fee_rate = BankAccount._validate_amount(external_fee_rate, allow_zero=True)
         self._max_attempts = max_attempts
         self._retry_delay = retry_delay
+        self._risk_analyzer = risk_analyzer
+
+    @property
+    def queue(self) -> TransactionQueue:
+        return self._queue
+
+    def _assess_risk(self, transaction: Transaction, amount: Decimal) -> None:
+        if self._risk_analyzer is None:
+            return
+        now = self._queue._clock()
+        risk = self._risk_analyzer.assess(
+            sender_id=self._queue._identify(transaction.sender),
+            recipient_number=transaction.recipient.account_number,
+            transaction_id=transaction.transaction_id,
+            amount=amount,
+            currency=transaction.currency,
+            now=now,
+        )
+        transaction.risk = risk
+        level = AuditLevel.INFO if risk.level is RiskLevel.LOW else AuditLevel.WARNING
+        self._queue._audit(transaction, "risk_assessed", now, level=level)
+        if risk.level is RiskLevel.HIGH:
+            raise RiskBlockedError("High risk: " + ", ".join(risk.reasons))
 
     def _transfer(self, transaction: Transaction) -> None:
         sender, recipient = transaction.sender, transaction.recipient
@@ -166,6 +234,7 @@ class TransactionProcessor:
             raise InvalidOperationError("Transaction currency must match the sender's currency")
 
         amount = BankAccount._validate_amount(transaction.amount)
+        self._assess_risk(transaction, amount)
         fee = Decimal(0)
         if transaction.transaction_type is TransactionType.EXTERNAL:
             fee = amount * self._external_fee_rate
@@ -210,13 +279,27 @@ class TransactionProcessor:
                 transaction.errors.append(TransactionError(now, transaction.attempts, reason))
                 transaction.failure_reason = reason
                 if isinstance(error, NightOperationError) and transaction.attempts < self._max_attempts:
+                    self._queue._audit(
+                        transaction, "retry_scheduled", now,
+                        level=AuditLevel.WARNING, error=type(error).__name__,
+                    )
                     self._queue._reschedule(transaction, priority, now + self._retry_delay)
                 else:
                     transaction.status = TransactionStatus.FAILED
                     transaction.finished_at = now
+                    self._queue._audit(
+                        transaction, "rejected", now,
+                        level=AuditLevel.ERROR, error=type(error).__name__,
+                    )
             else:
+                if self._risk_analyzer is not None:
+                    self._risk_analyzer.record_success(
+                        self._queue._identify(transaction.sender),
+                        transaction.recipient.account_number,
+                    )
                 transaction.status = TransactionStatus.COMPLETED
                 transaction.failure_reason = None
                 transaction.finished_at = self._queue._clock()
+                self._queue._audit(transaction, "completed", transaction.finished_at)
             processed.append(transaction)
         return processed

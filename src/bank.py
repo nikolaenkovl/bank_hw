@@ -10,7 +10,14 @@ from hashlib import pbkdf2_hmac
 from hmac import compare_digest
 from secrets import token_bytes
 from threading import Lock
+from typing import TYPE_CHECKING
 from uuid import uuid4
+
+from src.audit import AuditLog
+from src.risk import RiskAnalyzer
+
+if TYPE_CHECKING:
+    from src.transactions import TransactionProcessor
 
 from src.bank_account import (
     AccountClosedError,
@@ -83,14 +90,30 @@ class _Credentials:
 
 
 class Bank:
-    def __init__(self, *, clock: Callable[[], datetime] = datetime.now) -> None:
+    def __init__(
+        self, *, clock: Callable[[], datetime] = datetime.now, audit_log: AuditLog | None = None
+    ) -> None:
         self._clock = clock
+        self.audit_log = audit_log if audit_log is not None else AuditLog()
+        self._risk_analyzer = RiskAnalyzer()
         self._clients: dict[str, Client] = {}
         self._credentials: dict[str, _Credentials] = {}
         self._accounts: dict[str, BankAccount] = {}
         self._account_owners: dict[str, str] = {}
         self._suspicious_activities: list[SuspiciousActivity] = []
         self._authentication_lock = Lock()
+
+    def create_transaction_processor(self, **options) -> TransactionProcessor:
+        from src.transactions import TransactionProcessor, TransactionQueue
+
+        queue = TransactionQueue(
+            clock=self._clock, audit_log=self.audit_log, participant_id=self._participant_id
+        )
+        return TransactionProcessor(queue, risk_analyzer=self._risk_analyzer, **options)
+
+    def _participant_id(self, account: BankAccount) -> str:
+        number = account.account_number
+        return self._account_owners.get(number, number)
 
     @property
     def suspicious_activities(self) -> tuple[SuspiciousActivity, ...]:
