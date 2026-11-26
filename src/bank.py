@@ -137,7 +137,7 @@ class Bank:
             raise NightOperationError("Operations are unavailable from 00:00 until 05:00")
         return now
 
-    def _get_client(self, client_id: str) -> Client:
+    def get_client(self, client_id: str) -> Client:
         try:
             return self._clients[client_id]
         except KeyError as error:
@@ -145,7 +145,7 @@ class Bank:
 
     def _require_active_client(self, client_id: str, action: str) -> None:
         now = self._require_business_hours(action, client_id)
-        if self._get_client(client_id).status is ClientStatus.BLOCKED:
+        if self.get_client(client_id).status is ClientStatus.BLOCKED:
             self._record_activity(action, client_id, "blocked_client", now)
             raise ClientBlockedError("Client is blocked")
 
@@ -198,7 +198,7 @@ class Bank:
         self, client_id: str, account_type: type[BankAccount] = BankAccount, **options
     ) -> BankAccount:
         self._require_active_client(client_id, "open_account")
-        client = self._get_client(client_id)
+        client = self.get_client(client_id)
         if not isinstance(account_type, type) or not issubclass(account_type, BankAccount):
             raise InvalidOperationError("Expected a BankAccount subclass")
 

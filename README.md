@@ -41,3 +41,14 @@ PremiumAccount применяет лимит и фиксированную ко�
 Day 6 показывает 6 клиентов, 12 счетов, историю и итоговые отчёты. Чтобы
 сохранить журнал демонстрации, запусти
 `python3 -m scripts.demo_day6 --audit-file /tmp/bank-audit.jsonl`.
+
+В Day 7 `ReportBuilder` формирует отчёты по клиенту, банку и рискам.
+Демонстрация сохраняет каждый отчёт в TXT, JSON и CSV, а также три PNG-графика.
+Суммы в JSON сохраняются строками для точной передачи значений `Decimal`.
+Для графика движения баланса вызывай `capture_balances(timestamp)` после
+операций. Валюты отображаются на отдельных осях.
+
+```sh
+python3 -m pip install -r requirements.txt
+python3 -m scripts.demo_day7 --output reports
+```
