@@ -197,13 +197,14 @@ class Bank:
         if client_id is None:
             raise InvalidOperationError("Unknown account number")
         account = self._accounts[account_number]
-        if account.status is AccountStatus.CLOSED:
-            raise AccountClosedError("Account is closed")
-        if target is AccountStatus.ACTIVE and account.status is not AccountStatus.FROZEN:
-            raise InvalidOperationError("Only a frozen account can be unfrozen")
-        if target is AccountStatus.FROZEN and account.status is not AccountStatus.ACTIVE:
-            raise InvalidOperationError("Only an active account can be frozen")
-        account._status = target
+        with account._balance_lock:
+            if account.status is AccountStatus.CLOSED:
+                raise AccountClosedError("Account is closed")
+            if target is AccountStatus.ACTIVE and account.status is not AccountStatus.FROZEN:
+                raise InvalidOperationError("Only a frozen account can be unfrozen")
+            if target is AccountStatus.FROZEN and account.status is not AccountStatus.ACTIVE:
+                raise InvalidOperationError("Only an active account can be frozen")
+            account._status = target
 
     def close_account(self, account_number: str) -> None:
         self._change_account_status(account_number, AccountStatus.CLOSED, "close_account")

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from threading import Lock
+from threading import Lock, RLock
 from uuid import uuid4
 
 
@@ -91,6 +91,7 @@ class BankAccount(AbstractAccount):
         super().__init__(number, owner.strip(), opening_balance, account_status)
         self._currency = currency
         self._operation_guard: Callable[[], None] | None = None
+        self._balance_lock = RLock()
 
     @property
     def currency(self) -> str:
@@ -150,15 +151,25 @@ class BankAccount(AbstractAccount):
             raise AccountClosedError("Account is closed")
 
     def deposit(self, amount: Decimal | int | float | str) -> None:
+        with self._balance_lock:
+            self._balance = self._balance_after_deposit(amount)
+
+    def _balance_after_deposit(self, amount: Decimal | int | float | str) -> Decimal:
         self._require_active()
-        self._balance += self._validate_amount(amount)
+        return self.balance + self._validate_amount(amount)
 
     def withdraw(self, amount: Decimal | int | float | str) -> None:
+        with self._balance_lock:
+            self._balance = self._balance_after_withdrawal(amount)
+
+    def _balance_after_withdrawal(
+        self, amount: Decimal | int | float | str
+    ) -> Decimal:
         self._require_active()
         value = self._validate_amount(amount)
         if value > self._balance:
             raise InsufficientFundsError("Insufficient funds")
-        self._balance -= value
+        return self.balance - value
 
     def get_account_info(self) -> dict[str, str | Decimal | dict[str, Decimal]]:
         return {
@@ -206,18 +217,21 @@ class SavingsAccount(BankAccount):
     def monthly_interest_rate(self) -> Decimal:
         return self._monthly_interest_rate
 
-    def withdraw(self, amount: Decimal | int | float | str) -> None:
+    def _balance_after_withdrawal(
+        self, amount: Decimal | int | float | str
+    ) -> Decimal:
         self._require_active()
         value = self._validate_amount(amount)
         if value > self.balance - self.min_balance:
             raise InsufficientFundsError("Withdrawal would breach the minimum balance")
-        self._balance -= value
+        return self.balance - value
 
     def apply_monthly_interest(self) -> Decimal:
-        self._require_active()
-        interest = self.balance * self.monthly_interest_rate
-        self._balance += interest
-        return interest
+        with self._balance_lock:
+            self._require_active()
+            interest = self.balance * self.monthly_interest_rate
+            self._balance += interest
+            return interest
 
     def get_account_info(self) -> dict[str, str | Decimal | dict[str, Decimal]]:
         return {
@@ -251,7 +265,13 @@ class PremiumAccount(BankAccount):
         self._withdrawal_fee = self._validate_amount(withdrawal_fee, allow_zero=True)
         super().__init__(owner, balance, currency, status, account_number)
 
-    def withdraw(self, amount: Decimal | int | float | str) -> None:
+    @property
+    def withdrawal_fee(self) -> Decimal:
+        return self._withdrawal_fee
+
+    def _balance_after_withdrawal(
+        self, amount: Decimal | int | float | str
+    ) -> Decimal:
         self._require_active()
         value = self._validate_amount(amount)
         if value > self._withdrawal_limit:
@@ -259,7 +279,7 @@ class PremiumAccount(BankAccount):
         debit = value + self._withdrawal_fee
         if debit > self.balance + self._overdraft_limit:
             raise InsufficientFundsError("Withdrawal with fee exceeds the overdraft limit")
-        self._balance -= debit
+        return self.balance - debit
 
     def get_account_info(self) -> dict[str, str | Decimal | dict[str, Decimal]]:
         return {
@@ -300,22 +320,25 @@ class InvestmentAccount(BankAccount):
         return self.balance + sum(self._portfolio.values(), Decimal(0))
 
     def invest(self, asset_type: str, amount: Decimal | int | float | str) -> None:
-        self._require_active()
-        if asset_type not in self.ASSET_TYPES:
-            raise InvalidOperationError("Unknown asset type")
-        value = self._validate_amount(amount)
-        if value > self.balance:
-            raise InsufficientFundsError("Insufficient uninvested funds")
-        asset_balance = self._portfolio[asset_type] + value
-        self._balance -= value
-        self._portfolio[asset_type] = asset_balance
+        with self._balance_lock:
+            self._require_active()
+            if asset_type not in self.ASSET_TYPES:
+                raise InvalidOperationError("Unknown asset type")
+            value = self._validate_amount(amount)
+            if value > self.balance:
+                raise InsufficientFundsError("Insufficient uninvested funds")
+            asset_balance = self._portfolio[asset_type] + value
+            self._balance -= value
+            self._portfolio[asset_type] = asset_balance
 
-    def withdraw(self, amount: Decimal | int | float | str) -> None:
+    def _balance_after_withdrawal(
+        self, amount: Decimal | int | float | str
+    ) -> Decimal:
         self._require_active()
         value = self._validate_amount(amount)
         if value > self.balance:
             raise InsufficientFundsError("Only uninvested funds are available for withdrawal")
-        self._balance -= value
+        return self.balance - value
 
     def project_yearly_growth(
         self, growth_rates: Mapping[str, Decimal | int | float | str]
