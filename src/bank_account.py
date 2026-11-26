@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from threading import Lock
@@ -90,10 +90,15 @@ class BankAccount(AbstractAccount):
         number = self._reserve_number(account_number)
         super().__init__(number, owner.strip(), opening_balance, account_status)
         self._currency = currency
+        self._operation_guard: Callable[[], None] | None = None
 
     @property
     def currency(self) -> str:
         return self._currency
+
+    @property
+    def total_balance(self) -> Decimal:
+        return self.balance
 
     @classmethod
     def _reserve_number(cls, number: str | None) -> str:
@@ -137,6 +142,8 @@ class BankAccount(AbstractAccount):
         return value
 
     def _require_active(self) -> None:
+        if self._operation_guard is not None:
+            self._operation_guard()
         if self.status is AccountStatus.FROZEN:
             raise AccountFrozenError("Account is frozen")
         if self.status is AccountStatus.CLOSED:
@@ -287,6 +294,10 @@ class InvestmentAccount(BankAccount):
     @property
     def portfolio(self) -> dict[str, Decimal]:
         return self._portfolio.copy()
+
+    @property
+    def total_balance(self) -> Decimal:
+        return self.balance + sum(self._portfolio.values(), Decimal(0))
 
     def invest(self, asset_type: str, amount: Decimal | int | float | str) -> None:
         self._require_active()
